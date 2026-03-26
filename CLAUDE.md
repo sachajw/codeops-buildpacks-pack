@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`pack` is the CLI for [Cloud Native Buildpacks](https://buildpacks.io). It converts app source code into OCI container images using buildpacks, and helps authors package/distribute buildpacks. This is a fork of [buildpacks/pack](https://github.com/buildpacks/pack), written in Go.
+`pack` is the CLI for [Cloud Native Buildpacks](https://buildpacks.io). It converts app source code into OCI container images using buildpacks, and helps authors package/distribute buildpacks. This is a fork of [buildpacks/pack](https://github.com/buildpacks/pack), written in Go (1.25.x, modules).
 
 ## Commands
 
@@ -14,9 +14,10 @@ make unit           # Run unit + integration tests (output saved to out/unit)
 make acceptance     # Run acceptance tests (output saved to out/acceptance)
 make test           # Run all tests (unit + acceptance)
 make verify         # Check formatting and lint
-make format         # Format code with goimports
-make lint           # Run golangci-lint
-make tidy           # Format + tidy dependencies
+make format         # Format code with goimports + pedantic import grouping
+make lint           # Run golangci-lint (config: golangci.yaml)
+make tidy           # Format + tidy dependencies (both root and tools/ modules)
+make generate       # Regenerate mocks (mockgen)
 make prepare-for-pr # Full pre-PR check: clean, verify, test, uncommitted changes
 ```
 
@@ -36,35 +37,52 @@ NO_DOCKER=true make unit
 TEST_COVERAGE=true make unit
 ```
 
+**Run full cross-compatibility acceptance suite** (n-1 pack + lifecycle):
+```bash
+make acceptance-all   # requires GITHUB_TOKEN and network access
+```
+
 ## Architecture
 
 The codebase is split into `pkg/` (public API) and `internal/` (private implementation):
 
 ### Entry Flow
-`main.go` → `cmd.NewPackCommand()` (Cobra root) → each subcommand calls `initClient()` which constructs a `pkg/client.Client`
+`main.go` -> `cmd.NewPackCommand()` (Cobra root, in `cmd/cmd.go`) -> `initClient()` constructs a `pkg/client.Client` -> each subcommand in `internal/commands/` calls `client.*` methods.
 
 ### Key Packages
 
-**`pkg/client/`** — The main public API. `Client` is the central struct that wraps all pack operations (build, rebase, create-builder, package-buildpack, etc.). It holds a Docker client, image fetcher, logger, and cache. Most `internal/commands/` just parse flags and delegate to `client.*` methods.
+**`pkg/client/`** -- The main public API surface. `Client` is the central struct wrapping all pack operations (build, rebase, create-builder, package-buildpack, inspect, manifest, register, yank, pull, download-sbom, etc.). It holds a Docker client, image fetcher, blob downloader, logger, and keychain. Most `internal/commands/` files are thin wrappers: parse flags, call `client.*`, handle output.
 
-**`internal/commands/`** — One file per CLI subcommand. Commands are thin wrappers: validate args, call `pkg/client`, handle output.
+**`internal/commands/`** -- One file per CLI subcommand. The `PackClient` interface in `commands.go` defines the contract between commands and the client. Commands use `logError()` for consistent error handling (soft errors vs experiment errors).
 
-**`internal/build/`** — Executes the CNB lifecycle inside containers. `lifecycle_execution.go` orchestrates phases (detect → restore → analyze → build → export). Each phase runs as a container.
+**`internal/build/`** -- Executes the CNB lifecycle inside containers. `lifecycle_execution.go` orchestrates phases (detect -> restore -> analyze -> build -> export). `container_ops.go` handles Docker container operations. Each phase runs as a separate container.
 
-**`internal/builder/`** — Builder image logic: reading/writing builder metadata labels, computing buildpack detection order, validating builder configs.
+**`internal/builder/`** -- Builder image logic: reading/writing builder metadata labels, computing buildpack detection order, validating builder configs.
 
-**`internal/config/`** — Manages `~/.pack/config.toml`: default builder, trusted builders, registries, pull policies, experimental feature flags.
+**`internal/config/`** -- Manages `~/.pack/config.toml`: default builder, trusted builders, registries, pull policies, experimental feature flags.
 
-**`pkg/buildpack/`** — Buildpack downloading, packaging, and OCI label management.
+**`internal/registry/`** -- Registry implementation for buildpack distribution. Supports git, github, and index-based registries with caching.
 
-**`pkg/image/`** — Image fetching (local Docker daemon or remote registry), wrapping `buildpacks/imgutil`.
+**`internal/termui/`** -- Terminal UI for interactive buildpack detection (tview-based). Used during builds to display detection results.
+
+**`internal/inspectimage/`** -- Image inspection logic and display writers for BOM and image info output.
+
+**`pkg/buildpack/`** -- Buildpack downloading, packaging, multi-arch configuration, and OCI label management.
+
+**`pkg/image/`** -- Image fetching (local Docker daemon or remote registry), wrapping `buildpacks/imgutil`.
+
+**`buildpackage/`** -- Build package config reading (buildpack.toml / package.toml).
 
 ### Experimental Features
-Features behind the `--experimental` flag are gated by checking `config.Experimental` in the client. The registry and manifest commands are currently experimental.
+Features behind the `--experimental` flag are gated by checking `config.Experimental` in the client. The registry, manifest, and extension commands are currently experimental. `client.ExperimentError` triggers a tip message suggesting `pack config experimental true`.
 
 ### Testing Patterns
 - Unit/integration tests use `sclevine/spec` (BDD-style) with `gomega` matchers
-- Mocks generated by `golang/mock` live alongside their source files as `*_mock.go`
-- Acceptance tests in `acceptance/` spin up real Docker containers against a compiled `pack` binary
-- `testhelpers/` provides shared assertion helpers used across the test suite
+- Mocks generated by `golang/mock` via `//go:generate mockgen` directives; regenerated with `make generate`
+- Two mock locations: `pkg/testmocks/` (client-level mocks) and `internal/fakes/` + per-package `fakes/`
+- Acceptance tests in `acceptance/` spin up real Docker containers against a compiled `pack` binary; configured via `acceptance/testconfig/`
+- `testhelpers/` provides shared assertion helpers (registry, tar, image index, compare) used across the test suite
 - `testdata/` contains lifecycle binaries, sample buildpacks, and app fixtures
+
+### Dependency Management
+This repo has **two Go modules**: the root `go.mod` and `tools/go.mod` (for dev tooling like mockgen, goimports, golangci-lint). Run `make tidy` to tidy both.
